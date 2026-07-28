@@ -1,0 +1,106 @@
+# moltcops-rules.toml — gitleaks config for the MoltCops leak-scanning pipeline
+#
+# Design notes:
+#   * Tier-1 agent-ecosystem rules first (LLM keys, MCP configs) — these are
+#     the brand differentiator; generic cloud keys are table stakes.
+#   * BIP39 seed phrases are deliberately NOT a regex rule here. Regex cannot
+#     validate checksums and false-positives on prose. Pipe candidate files
+#     through bip39_filter.py instead — it validates the checksum.
+#   * The eth-private-key rule is keyword-gated: a bare 64-hex string is
+#     usually a tx hash, block hash, or commit SHA. It only fires when the
+#     fragment also contains wallet/key context words.
+#   * Well-known PUBLIC development keys (Hardhat/Anvil/Ganache defaults and
+#     vendor documentation examples) are allowlisted — they are not leaks.
+#   * Manual triage is always the last step. A match is a candidate, not a
+#     verdict. Never auto-publish anything from scanner output.
+
+title = "MoltCops agent-ecosystem leak rules"
+
+# ---------------------------------------------------------------- Tier 1 ---
+[[rules]]
+id = "openai-api-key"
+description = "OpenAI API key (sk-... / sk-proj-...)"
+regex = '''\bsk-(?:proj-)?[A-Za-z0-9_\-]{20,}\b'''
+keywords = ["sk-"]
+[rules.allowlist]
+description = "Anthropic keys are claimed by the more specific anthropic-api-key rule"
+regexTarget = "secret"
+regexes = ['''sk-ant-.*''']
+
+[[rules]]
+id = "anthropic-api-key"
+description = "Anthropic API key (sk-ant-...)"
+regex = '''\bsk-ant-[A-Za-z0-9_\-]{20,}\b'''
+keywords = ["sk-ant-"]
+
+[[rules]]
+id = "google-ai-key"
+description = "Google AI / GCP API key (AIza...)"
+regex = '''\bAIza[0-9A-Za-z_\-]{35}\b'''
+keywords = ["aiza"]
+
+[[rules]]
+id = "mcp-config-secret"
+description = "MCP server config with an embedded credential value"
+regex = '''(?i)(api[_-]?key|token|secret|password)["']?\s*[:=]\s*["'][^"'\s]{8,}'''
+keywords = ["mcpservers", "claude_desktop_config", "mcp.json"]
+
+# ---------------------------------------------------------------- Tier 2 ---
+[[rules]]
+id = "eth-private-key"
+description = "Ethereum-style private key (64 hex) in a file with wallet/key context"
+# NOTE: gitleaks keywords are a FILE-SCOPED prefilter, not a proximity check —
+# this fires on a 64-hex string anywhere in a file that also contains a
+# keyword, however far apart. It cuts false positives (bare tx hashes in
+# docs) but does not eliminate them. Triage manually.
+regex = '''(?:0x)?[0-9a-fA-F]{64}'''
+keywords = ["private_key", "privatekey", "mnemonic", "deployer",
+            "secret_key", "wallet"]
+[rules.allowlist]
+description = "Public development keys (Hardhat/Anvil/Ganache defaults) — not leaks. All 10 Hardhat mnemonic accounts, BIP32-derived from the published 'test...junk' mnemonic and anchored on documented #0/#1."
+regexTarget = "match"
+regexes = [
+  # Hardhat/Anvil accounts #0-#9 (m/44'/60'/0'/0/0..9)
+  '''ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80''',
+  '''59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d''',
+  '''5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a''',
+  '''7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6''',
+  '''47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a''',
+  '''8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba''',
+  '''92db14e403b83dfe3df233f83dfa3a0d7096f21ca9b0d6d6b8d88b2b4ec1564e''',
+  '''4bbbf85ce3377467afe5d46f804f221813b2bb87f24d81f60f1fcdbf7cbf4356''',
+  '''dbda1821b80551c9d65939329250298aa3472ba22feea921c0cf5d620ea67b97''',
+  '''2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6''',
+  # Ganache default account #0
+  '''4f3edf983ac636a65a842ce7c78d9aa706d3b113bce9c46f30d7d21715b23b1d''',
+]
+
+# ---------------------------------------------------------------- Tier 3 ---
+[[rules]]
+id = "github-token"
+description = "GitHub personal access / OAuth token"
+regex = '''\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\b|\bgithub_pat_[A-Za-z0-9_]{22,}\b'''
+keywords = ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"]
+
+[[rules]]
+id = "aws-access-key"
+description = "AWS access key ID"
+regex = '''\b(?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}\b'''
+keywords = ["akia", "asia", "aida", "aroa", "aws"]
+
+[[rules]]
+id = "slack-token"
+description = "Slack bot/user/app token"
+regex = '''\bxox[baprs]-[A-Za-z0-9-]{10,}\b'''
+keywords = ["xox"]
+
+[[rules]]
+id = "discord-bot-token"
+description = "Discord bot token (all bot-ID generations, 2015-present)"
+# The first segment is unpadded base64 of the bot ID's decimal-ASCII string,
+# so its length is 23/24/26 chars — never 25 (an unpadded base64 length is
+# never 1 mod 4; a fixed-25 pattern matches NOTHING real). Bot IDs starting
+# with digit 1-3 encode to 'M…', 4-7 to 'N…', 8-9 to 'O…', so [MNO] covers
+# every generation since 2015.
+regex = '''\b[MNO][A-Za-z\d]{22,25}\.[\w-]{6}\.[\w-]{27,}\b'''
+keywords = ["discord", "bot_token", "bot-token", "discord_token"]

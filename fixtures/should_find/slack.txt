@@ -1,0 +1,2 @@
+FIXTURE — fabricated credential, not a real key
+SLACK_BOT_TOKEN=xoxb-123456789012-fakefakefake

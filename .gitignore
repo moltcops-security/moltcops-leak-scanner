@@ -1,0 +1,17 @@
+# The findings database is pointers-only, but the aggregate pattern of
+# WHERE you've found leaks is itself sensitive — and operator-supplied
+# --query text can itself carry secret fragments. Never commit ANY of it,
+# whatever --db filename was used.
+*.db
+*.sqlite
+*.db-journal
+
+# scan_repo.sh no longer writes inside the repo (outputs default to
+# ~/moltcops-secure/ per CLAUDE.md rule 2). This ignore stays as
+# belt-and-suspenders for older scans or MOLTCOPS_OUTPUT_DIR overrides
+# pointed at the checkout.
+scan-*/
+
+# Python
+__pycache__/
+*.pyc

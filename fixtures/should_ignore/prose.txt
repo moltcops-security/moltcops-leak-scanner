@@ -1,0 +1,2 @@
+The agent can access the account, add an address, and then act on the list.
+(Ordinary prose full of BIP39 words — bip39_filter.py handles this, not gitleaks.)

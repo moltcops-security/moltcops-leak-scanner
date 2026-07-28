@@ -1,0 +1,3 @@
+# bip39_filter.py, github_search.py: stdlib only (no dependencies)
+# wallet_check.py:
+pycryptodome>=3.20
