@@ -38,7 +38,7 @@ constraints. They override any "helpful" instinct.
 python3 bip39_filter.py --self-test       # seed-phrase detection + checksum
 python3 wallet_check.py --self-test       # derivation + live read-only RPC
 python3 github_search.py --self-test      # pacing/backoff/dedup (offline)
-python3 safety_self_test.py               # rules 1-2 as grep-level assertions
+python3 safety_self_test.py               # rules 1-2 source + offline behavior checks
 gitleaks dir fixtures --config moltcops-rules.toml --exit-code 0
 # expected: exactly 10 findings, 0 in fixtures/should_ignore or hardhat.config.ts
 # (10 positive detections + 4 silent files = the README's "14 assertions")
@@ -66,6 +66,6 @@ two-seeds-in-one-message case exists in bip39_filter._self_test because
 
 ## Style
 
-Python 3.12, stdlib-first (only dependency: pycryptodome for keccak).
+Python 3.10+, stdlib-first (only dependency: pycryptodome for keccak).
 Type hints, docstrings that explain WHY (the ethics constraints are the
 design), redaction in any output layer that could touch a real secret.

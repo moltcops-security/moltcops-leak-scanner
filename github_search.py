@@ -18,12 +18,13 @@ Usage:
     export GITHUB_TOKEN=github_pat_...   # dedicated research-identity token
     python3 github_search.py                      # run default query set
     python3 github_search.py --query '"sk-proj-" language:python'
-    python3 github_search.py --dry-run            # show queries, no API calls
+    python3 github_search.py --dry-run            # show safe query labels, no API calls
     python3 github_search.py --stats              # summarize the database
     python3 github_search.py --self-test          # offline test, no token needed
 """
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -76,9 +77,17 @@ CREATE TABLE IF NOT EXISTS scan_runs (
     ran_at      TEXT NOT NULL,
     query       TEXT NOT NULL,
     total_count INTEGER,
-    fetched     INTEGER
+    fetched     INTEGER,
+    incomplete  INTEGER NOT NULL DEFAULT 0
 );
 """
+DB_VERSION = 1
+
+
+def query_label(query: str) -> str:
+    """Return a deterministic opaque identifier without retaining fragments."""
+    digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
+    return f"query-sha256:{digest}"
 
 
 # --- transport (module-level so tests can stub it) -------------------------
@@ -151,21 +160,43 @@ def search_code(query: str, token: str, pacer: Pacer, page: int = 1,
         # and logs, and error bodies can echo the query (which may carry a
         # secret prefix the operator typed).
         raise RuntimeError(
-            f"GitHub API {status} for query {query!r} "
+            f"GitHub API {status} for {query_label(query)} "
             f"({len(body)}-byte body not logged)")
-    raise RuntimeError(f"GitHub API kept rejecting after {MAX_RETRIES} tries: {query!r}")
+    raise RuntimeError(
+        f"GitHub API kept rejecting after {MAX_RETRIES} tries for {query_label(query)}")
 
 
 # --- storage ----------------------------------------------------------------
 def init_db(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.executescript(SCHEMA)
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version > DB_VERSION:
+        conn.close()
+        raise RuntimeError(
+            f"database version {version} is newer than supported {DB_VERSION}")
+    if version == 0:
+        # Version 0 persisted raw search strings. Hash every row exactly once,
+        # including raw input that happens to look like an opaque label; only
+        # user_version can distinguish migrated data from label-shaped input.
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(scan_runs)")}
+        if "incomplete" not in columns:
+            conn.execute(
+                "ALTER TABLE scan_runs ADD COLUMN incomplete INTEGER NOT NULL DEFAULT 0")
+        for table in ("findings", "scan_runs"):
+            for row_id, query in conn.execute(f"SELECT id, query FROM {table}"):
+                conn.execute(
+                    f"UPDATE {table} SET query=? WHERE id=?",
+                    (query_label(query), row_id))
+        conn.execute(f"PRAGMA user_version = {DB_VERSION}")
+    conn.commit()
     return conn
 
 
 def store_results(conn: sqlite3.Connection, query: str, payload: dict) -> int:
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     items = payload.get("items", [])
+    label = query_label(query)
     for it in items:
         repo = it.get("repository", {}).get("full_name", "?")
         conn.execute(
@@ -174,32 +205,36 @@ def store_results(conn: sqlite3.Connection, query: str, payload: dict) -> int:
                ON CONFLICT(repo, path) DO UPDATE SET
                  last_seen=excluded.last_seen,
                  html_url=excluded.html_url""",  # URLs rot (branch renames) — refresh
-            (query, repo, it.get("path", "?"), it.get("html_url", "?"), now, now))
+            (label, repo, it.get("path", "?"), it.get("html_url", "?"), now, now))
     conn.execute(
-        "INSERT INTO scan_runs (ran_at, query, total_count, fetched) VALUES (?,?,?,?)",
-        (now, query, payload.get("total_count"), len(items)))
+        """INSERT INTO scan_runs
+           (ran_at, query, total_count, fetched, incomplete) VALUES (?,?,?,?,?)""",
+        (now, label, payload.get("total_count"), len(items),
+         int(bool(payload.get("incomplete_results", False)))))
     conn.commit()
     return len(items)
 
 
 def run_query(conn: sqlite3.Connection, query: str, token: str,
-              pacer: Pacer) -> tuple[int, int, bool]:
+              pacer: Pacer) -> tuple[int, int, bool, bool]:
     """Paginate one query to completion (API cap: 10 pages of 100).
 
-    Returns (fetched, total_count, hit_api_cap). Stopping at page 1 would
-    silently under-report — the monthly report's baseline depends on
+    Returns (fetched, total_count, hit_api_cap, incomplete). Stopping at page 1
+    would silently under-report — the monthly report's baseline depends on
     complete counts.
     """
     fetched = total_count = 0
+    incomplete = False
     for page in range(1, 11):
         payload = search_code(query, token, pacer, page=page)
         items = payload.get("items", [])
         total_count = payload.get("total_count", 0)
+        incomplete = incomplete or bool(payload.get("incomplete_results", False))
         store_results(conn, query, payload)
         fetched += len(items)
         if len(items) < 100 or page * 100 >= total_count:
             break
-    return fetched, total_count, total_count > fetched
+    return fetched, total_count, total_count > fetched, incomplete
 
 
 def print_stats(conn: sqlite3.Connection) -> None:
@@ -210,8 +245,11 @@ def print_stats(conn: sqlite3.Connection) -> None:
         "SELECT COUNT(*) FROM findings WHERE notified_at IS NOT NULL").fetchone()[0]
     repos = conn.execute("SELECT COUNT(DISTINCT repo) FROM findings").fetchone()[0]
     runs = conn.execute("SELECT COUNT(*) FROM scan_runs").fetchone()[0]
+    incomplete_runs = conn.execute(
+        "SELECT COUNT(*) FROM scan_runs WHERE incomplete != 0").fetchone()[0]
     print(f"findings: {total} ({new} new, {notified} notified) across {repos} repos")
     print(f"scan runs logged: {runs}")
+    print(f"incomplete scan runs: {incomplete_runs}")
     print("\nnewest unreviewed pointers:")
     for repo, path, url in conn.execute(
             "SELECT repo, path, html_url FROM findings WHERE status='new' "
@@ -221,6 +259,8 @@ def print_stats(conn: sqlite3.Connection) -> None:
 
 # --- self-test (offline, no token) ------------------------------------------
 def _self_test() -> int:
+    import contextlib
+    import io
     import tempfile
 
     calls = {"n": 0, "sleeps": []}
@@ -250,6 +290,8 @@ def _self_test() -> int:
         pacer = Pacer(sleep=fake_sleep)
         with tempfile.TemporaryDirectory() as td:
             conn = init_db(os.path.join(td, "t.db"))
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == DB_VERSION, \
+                "new database did not set current user_version"
             n1 = store_results(conn, "q1", search_code("q1", "tok", pacer))
             # second call: paces + survives a 403 with Retry-After
             n2 = store_results(conn, "q2", search_code("q2", "tok", pacer))
@@ -289,8 +331,10 @@ def _self_test() -> int:
                 }).encode()
             http_get = paged_get
             pacer2 = Pacer(sleep=fake_sleep)
-            fetched, total, capped = run_query(conn, "paged-q", "tok", pacer2)
-            assert (fetched, total, capped) == (150, 150, False), (fetched, total)
+            fetched, total, capped, incomplete = run_query(
+                conn, "paged-q", "tok", pacer2)
+            assert (fetched, total, capped, incomplete) == (150, 150, False, False), \
+                (fetched, total, capped, incomplete)
             rows = conn.execute(
                 "SELECT COUNT(*) FROM findings WHERE repo='r/s'").fetchone()[0]
             assert rows == 150, f"pagination stored {rows}/150"
@@ -307,12 +351,118 @@ def _self_test() -> int:
             pacer3 = Pacer(sleep=fake_sleep)
             search_code("retry-q", "tok", pacer3)
             assert calls["n"] == 2, f"no retry after URLError (calls={calls['n']})"
+
+            # Operator-supplied queries can themselves contain sensitive text.
+            # Only a deterministic opaque label may reach logs/errors/storage.
+            sensitive_query = 'operator-private-marker-Z9Y8X7 filename:.env'
+            http_get = lambda url, token: (200, {}, json.dumps({
+                "total_count": 1,
+                "incomplete_results": False,
+                "items": [{"path": "safe-pointer.env",
+                           "html_url": "https://github.com/x/y/blob/main/safe-pointer.env",
+                           "repository": {"full_name": "x/y"}}],
+            }).encode())
+            run_query(conn, sensitive_query, "tok", Pacer(sleep=fake_sleep))
+            db_text = "\n".join(conn.iterdump())
+            assert sensitive_query not in db_text, "custom query stored verbatim"
+            assert "operator-private-marker" not in db_text, "custom-query fragment stored"
+
+            http_get = lambda url, token: (422, {}, b'{"message":"bad query"}')
+            try:
+                search_code(sensitive_query, "tok", Pacer(sleep=fake_sleep))
+                assert False, "non-retryable API error did not raise"
+            except RuntimeError as exc:
+                error = str(exc)
+                assert sensitive_query not in error, "API error echoed custom query"
+                assert "operator-private-marker" not in error, "API error leaked query fragment"
+
+            # GitHub explicitly says when search results are incomplete. Record
+            # and return that state; never silently treat the response complete.
+            http_get = lambda url, token: (200, {}, json.dumps({
+                "total_count": 0, "incomplete_results": True, "items": [],
+            }).encode())
+            outcome = run_query(conn, sensitive_query, "tok", Pacer(sleep=fake_sleep))
+            assert len(outcome) == 4 and outcome[3] is True, outcome
+            incomplete = conn.execute(
+                "SELECT incomplete FROM scan_runs ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
+            assert incomplete == 1, "incomplete_results not recorded"
+
+            # A pre-hardening database contains raw query text and lacks the
+            # incomplete column. Version-0 migration must scrub both
+            # query-bearing tables unconditionally: label-shaped text may be
+            # legacy raw input rather than an already-migrated value.
+            old_db = os.path.join(td, "old-schema.db")
+            old = sqlite3.connect(old_db)
+            old.executescript("""
+                CREATE TABLE findings (
+                    id INTEGER PRIMARY KEY, query TEXT NOT NULL,
+                    repo TEXT NOT NULL, path TEXT NOT NULL, html_url TEXT NOT NULL,
+                    first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+                    notified_at TEXT, status TEXT NOT NULL DEFAULT 'new',
+                    UNIQUE(repo, path));
+                CREATE TABLE scan_runs (
+                    id INTEGER PRIMARY KEY, ran_at TEXT NOT NULL,
+                    query TEXT NOT NULL, total_count INTEGER, fetched INTEGER);
+            """)
+            legacy_query = "fabricated-sensitive-migration-marker-Q4W5E6"
+            label_shaped_raw_query = "query-sha256:deadbeefdeadbeef"
+            old.execute(
+                "INSERT INTO findings (query, repo, path, html_url, first_seen, last_seen) "
+                "VALUES (?, 'legacy/repo', 'pointer', 'https://example.invalid/p', 't', 't')",
+                (legacy_query,))
+            old.execute(
+                "INSERT INTO findings (query, repo, path, html_url, first_seen, last_seen) "
+                "VALUES (?, 'labeled/repo', 'pointer', 'https://example.invalid/q', 't', 't')",
+                (label_shaped_raw_query,))
+            old.execute(
+                "INSERT INTO scan_runs (ran_at, query, total_count, fetched) "
+                "VALUES ('t', ?, 1, 1)", (legacy_query,))
+            old.execute(
+                "INSERT INTO scan_runs (ran_at, query, total_count, fetched) "
+                "VALUES ('t', ?, 1, 1)", (label_shaped_raw_query,))
+            old.commit()
+            old.close()
+
+            migrated = init_db(old_db)
+            assert migrated.execute("PRAGMA user_version").fetchone()[0] == 1, \
+                "legacy migration did not set user_version"
+            migrated_dump = "\n".join(migrated.iterdump())
+            assert legacy_query not in migrated_dump, "migration retained raw legacy query"
+            expected_label = query_label(legacy_query)
+            finding_queries = [r[0] for r in migrated.execute(
+                "SELECT query FROM findings ORDER BY id")]
+            run_queries = [r[0] for r in migrated.execute(
+                "SELECT query FROM scan_runs ORDER BY id")]
+            expected_shaped_label = query_label(label_shaped_raw_query)
+            assert finding_queries == [expected_label, expected_shaped_label], finding_queries
+            assert run_queries == [expected_label, expected_shaped_label], run_queries
+
+            # A later init is idempotent because the explicit schema version,
+            # not label syntax, records that migration has completed.
+            migrated.close()
+            reopened = init_db(old_db)
+            assert [r[0] for r in reopened.execute(
+                "SELECT query FROM findings ORDER BY id")] == finding_queries
+            assert [r[0] for r in reopened.execute(
+                "SELECT query FROM scan_runs ORDER BY id")] == run_queries
+            migrated = reopened
+
+            migrated.execute("UPDATE scan_runs SET incomplete=1 WHERE id=1")
+            migrated.commit()
+            stats_output = io.StringIO()
+            with contextlib.redirect_stdout(stats_output):
+                print_stats(migrated)
+            assert "incomplete scan runs: 1" in stats_output.getvalue(), \
+                "--stats does not surface persisted incomplete scans"
+            migrated.close()
     finally:
         http_get = real_get
 
     print("github_search self-test: pacing, Retry-After backoff, dedup, "
-          "scan_runs logging, pointers-only storage, pagination, "
-          "transport-error retry — all OK")
+          "scan_runs logging, pointers-only/redacted storage, pagination, "
+          "transport-error retry, redacted errors, incomplete-results "
+          "recording/stats, legacy-query migration — all OK")
     return 0
 
 
@@ -336,7 +486,7 @@ def main() -> int:
         print(f"would run {len(queries)} queries "
               f"(~{len(queries) * 7 / 60:.0f} min at 10 req/min pacing):")
         for q in queries:
-            print(f"  {q}")
+            print(f"  {query_label(q)}")
         return 0
 
     conn = init_db(args.db)
@@ -351,10 +501,12 @@ def main() -> int:
     pacer = Pacer()
     total_fetched = 0
     for q in queries:
-        fetched, total_count, capped = run_query(conn, q, token, pacer)
+        fetched, total_count, capped, incomplete = run_query(conn, q, token, pacer)
         total_fetched += fetched
         note = " (API 1000-result cap hit — narrow this query)" if capped else ""
-        print(f"[{q}] total_count={total_count} fetched={fetched}{note}")
+        if incomplete:
+            note += " (INCOMPLETE GitHub result set — do not treat as complete)"
+        print(f"[{query_label(q)}] total_count={total_count} fetched={fetched}{note}")
     print(f"\ndone. {total_fetched} result pointers fetched "
           f"(deduplicated in {args.db}; run with --stats to review).")
     return 0
