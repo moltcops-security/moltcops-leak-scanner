@@ -57,7 +57,7 @@ regex = '''(?:0x)?[0-9a-fA-F]{64}'''
 keywords = ["private_key", "privatekey", "mnemonic", "deployer",
             "secret_key", "wallet"]
 [rules.allowlist]
-description = "Public development keys (Hardhat/Anvil/Ganache defaults) — not leaks. All 10 Hardhat mnemonic accounts, BIP32-derived from the published 'test...junk' mnemonic and anchored on documented #0/#1."
+description = "Public development keys (Hardhat/Anvil/Ganache defaults) — not leaks. All 10 Hardhat mnemonic accounts, BIP32-derived from the published 'test...junk' mnemonic and anchored on documented #0/#1. Also uint256 math constants (MAX_UINT256 / zero word): 64 hex chars, never a key."
 regexTarget = "match"
 regexes = [
   # Hardhat/Anvil accounts #0-#9 (m/44'/60'/0'/0/0..9)
@@ -73,6 +73,12 @@ regexes = [
   '''2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6''',
   # Ganache default account #0
   '''4f3edf983ac636a65a842ce7c78d9aa706d3b113bce9c46f30d7d21715b23b1d''',
+  # uint256 math constants (MAX_UINT256, zero word) — dogfood scan of
+  # moltshield flagged 5 of these: 64 f's / 64 zeros are valid hex, and the
+  # file-scoped keyword gate passes wherever test names mention "private
+  # key". Every DeFi repo has them; anchored so only exact constants match.
+  '''^(0x)?f{64}$''',
+  '''^(0x)?0{64}$''',
 ]
 
 # ---------------------------------------------------------------- Tier 3 ---

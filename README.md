@@ -29,12 +29,12 @@ research instead of intrusion.
 | File | What it does | Verified |
 |---|---|---|
 | `github_search.py` | Runs the MoltCops query set against GitHub code search. Paced at ≤10 req/min with Retry-After backoff and transport retries; paginates to the API cap. Stores **pointers only** (repo/path/URL) + scan-run metadata in sqlite — never file contents. Queries are represented only by deterministic SHA-256 labels in storage, output, and errors; GitHub `incomplete_results` is recorded and surfaced. | offline self-test: pacing, backoff, dedup, redaction, completeness, pointers-only |
-| `moltcops-rules.toml` | gitleaks config: LLM keys, MCP-config secrets, keyword-gated ETH keys, GH/AWS/Slack/Discord tokens. Allowlists public dev keys (Hardhat/Ganache). BIP39 deliberately excluded — regex can't validate checksums. | exactly 10 findings + 4 intentionally silent files = 14 fixture assertions |
+| `moltcops-rules.toml` | gitleaks config: LLM keys, MCP-config secrets, keyword-gated ETH keys, GH/AWS/Slack/Discord tokens. Allowlists public dev keys (Hardhat/Ganache) and uint256 math constants (MAX_UINT256/zero word). BIP39 deliberately excluded — regex can't validate checksums. | exactly 10 findings + 5 intentionally silent files = 15 fixture assertions |
 | `bip39_filter.py` | Finds seed phrases in text and **validates the BIP39 checksum** — kills the prose false-positives that make wordlist-only matching unusable. Redacts phrases in output, filters known doc test vectors, and finds multiple/overlapping valid windows. | self-test, including two seeds in one message |
 | `wallet_check.py` | Given an exposed private key: derives the address **offline** (self-contained secp256k1 — no deps beyond keccak), then reads native + major stablecoin balances across 5 EVM chains via public unauthenticated RPC. The key never leaves your machine. Reads the key from a hidden prompt or stdin by default — argv is warned against (shell history + `ps`). | 3 exact derivation vectors + malformed-key rejection; read-only RPC/token-table checks skip gracefully offline |
 | `scan_repo.sh` | One-command deep scan of a repo's full history (trufflehog + gitleaks, both verification-off). Reports land only in `~/moltcops-secure/`, per rule 2. The root must be a current-user-owned, mode-0700 real directory. Scanner failures exit nonzero while retaining reports for incomplete-result triage. | behavior enforced by the offline safety test |
 | `safety_self_test.py` | Executable safety assertions: verification-off, real scanner failure propagation/report retention, fixed secure output root, anchored DB ignore, preview-fragment prohibition, pointers-only storage, read-only RPC, and safe key input. | exits nonzero on any violation; fake scanners only, no network |
-| `fixtures/` | Fabricated-credential test suite for the gitleaks config. | exactly 10 findings; 4 silent files; 14 assertions total |
+| `fixtures/` | Fabricated-credential test suite for the gitleaks config. | exactly 10 findings; 5 silent files; 15 assertions total |
 
 ## Setup
 
@@ -137,7 +137,9 @@ gitleaks dir fixtures --config moltcops-rules.toml --exit-code 0
 
 The final command must report exactly **10 findings**, with zero findings in
 `fixtures/should_ignore/` and `fixtures/should_find/hardhat.config.ts`: 10
-positive detections plus 4 intentionally silent files = **14 assertions**.
+positive detections plus 5 intentionally silent files = **15 assertions**
+(the 5 are the `should_ignore/` suite; `should_find/hardhat.config.ts` is a
+sixth zero-finding file, counted with the positives it lives among).
 
 `fixtures/` contains **fabricated** credentials only (plus AWS's and
 Hardhat's own published example/dev keys, which the rules are configured to

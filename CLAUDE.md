@@ -41,7 +41,7 @@ python3 github_search.py --self-test      # pacing/backoff/dedup (offline)
 python3 safety_self_test.py               # rules 1-2 source + offline behavior checks
 gitleaks dir fixtures --config moltcops-rules.toml --exit-code 0
 # expected: exactly 10 findings, 0 in fixtures/should_ignore or hardhat.config.ts
-# (10 positive detections + 4 silent files = the README's "14 assertions")
+# (10 positive detections + 5 silent files = the README's "15 assertions")
 ```
 
 A change is not done until all five pass. If you change detection logic,
